@@ -1248,6 +1248,46 @@ body.client-only .host-only { display: none !important; }
     line-height: 1.2;
 }
 
+/* ── v2.0.8: Viewer debug row (inline in dock stats) ─────────────────────────── */
+.viewer-debug-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 8px;
+    font-family: var(--mono);
+    padding: 2px 4px;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.03);
+}
+.viewer-debug-row .vdr-name {
+    flex: 0 0 auto;
+    min-width: 60px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+}
+.viewer-debug-row .vdr-stat {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+.viewer-debug-row .vdr-stat .label { color: var(--muted2); }
+.viewer-debug-row .vdr-stat .val { color: var(--accent); font-weight: 600; }
+.viewer-debug-row .vdr-buf-ok   { color: var(--green, #4ade80); }
+.viewer-debug-row .vdr-buf-warn { color: var(--warn, #facc15); }
+.viewer-debug-row .vdr-buf-full { color: var(--danger, #ef4444); }
+.viewer-debug-row .vdr-state {
+    font-size: 7px;
+    padding: 1px 4px;
+    border-radius: 2px;
+    text-transform: uppercase;
+}
+.viewer-debug-row .vdr-state.connected    { background: rgba(74,222,128,0.15); color: #4ade80; }
+.viewer-debug-row .vdr-state.connecting   { background: rgba(250,204,21,0.15); color: #facc15; }
+.viewer-debug-row .vdr-state.disconnected { background: rgba(239,68,68,0.15); color: #ef4444; }
+.viewer-debug-row .vdr-state.failed       { background: rgba(239,68,68,0.15); color: #ef4444; }
+
 /* ── v2.0.6: Viewer card styles (used inside settingsModal Viewers tab) ──────── */
 .viewer-panel-card {
     background: rgba(255,255,255,0.04);

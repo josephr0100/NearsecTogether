@@ -1426,6 +1426,37 @@ async function sendOfferToViewer(viewerId) {
     // ── THE MISSING UDP TUNNEL ──
     pc.wcChannel = pc.createDataChannel('webcodecs', { ordered: false, maxRetransmits: 0 });
     pc.wcChannel.bufferedAmountLowThreshold = 256 * 1024;
+    pc.wcChannel.onbufferedamountlow = () => {
+        // When a congested channel drains, request keyframe for resync
+        if (_wcEncoder && _wcEncoder.state !== 'closed') _wcForceKeyframe = true;
+    };
+    // Bidirectional ping/pong RTT measurement
+    pc.wcChannel.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+            try {
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'wc-ping') {
+                    // Viewer is pinging us — respond so viewer can measure RTT
+                    pc.wcChannel.send(JSON.stringify({ type: 'wc-pong', t: msg.t }));
+                } else if (msg.type === 'wc-pong') {
+                    // Our ping to the viewer came back — measure host-side RTT
+                    pc._wcRtt = performance.now() - msg.t;
+                    console.log(`[RTT] ${viewerId} → ${pc._wcRtt.toFixed(1)}ms`);
+                } else if (msg.type === 'wc-pressure') {
+                    if (msg.level === 'recover') {
+                        _wcViewerPressure.delete(viewerId);
+                    } else {
+                        _wcViewerPressure.set(viewerId, {
+                            level: msg.level === 'critical' ? 'critical' : 'high',
+                            mobile: !!msg.mobile,
+                            time: performance.now(),
+                            detail: msg.detail || null
+                        });
+                    }
+                }
+            } catch (_) {}
+        }
+    };
 
     // ── UDP FAST-LANE FOR INPUT ──
     pc.inputChannel = pc.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
@@ -2439,10 +2470,15 @@ let _wcForceKeyframe = false;
 let _wcVideoTrack    = null;
 let _wcForceSoftware = false;
 let _lastKeyframeSentAt = 0;
+let _wcViewerPressure = new Map();
+let _wcPressureFrameCounter = 0;
+let _wcFragmentFrameId = 1;
 const WC_MAX_ENCODER_QUEUE = 6;
 const WC_SOFT_CHANNEL_BUFFER_BYTES = 768 * 1024;
 const WC_MAX_CHANNEL_BUFFER_BYTES = 1500 * 1024;
+const WC_DROP_CHANNEL_BUFFER_BYTES = 3 * 1024 * 1024;
 const WC_MAX_VPS_BUFFER_BYTES = 1500 * 1024;
+const WC_DROP_VPS_BUFFER_BYTES = 3 * 1024 * 1024;
 const WC_DEFAULT_BITRATE = 4000000;
 const WC_KEYFRAME_INTERVAL_MS = 3000;
 
@@ -2464,7 +2500,58 @@ function getMaxWcChannelBufferedAmount() {
 
 function isWebCodecsPipelineCongested(encoder) {
     if (encoder && encoder.encodeQueueSize > WC_MAX_ENCODER_QUEUE) return true;
-    return getMaxWcChannelBufferedAmount() > WC_SOFT_CHANNEL_BUFFER_BYTES;
+    if (areAllWcVideoTargetsCongested()) return true;
+    return false;
+}
+
+function areAllWcVideoTargetsCongested() {
+    if (_vpsWs && _vpsAuthOk && _vpsWs.readyState === 1) {
+        return (_vpsWs.bufferedAmount || 0) > WC_SOFT_CHANNEL_BUFFER_BYTES;
+    }
+
+    let openChannels = 0;
+    if (typeof peerConnections !== 'undefined') {
+        for (const pc of Object.values(peerConnections)) {
+            const ch = pc.wcChannel;
+            if (!ch || ch.readyState !== 'open') continue;
+            openChannels++;
+            if ((ch.bufferedAmount || 0) <= WC_MAX_CHANNEL_BUFFER_BYTES) return false;
+        }
+    }
+    return openChannels > 0;
+}
+
+/** Number of viewers with open DataChannels (P2P) */
+function getWcViewerCount() {
+    let count = 0;
+    if (typeof peerConnections !== 'undefined') {
+        for (const pc of Object.values(peerConnections)) {
+            if (pc.wcChannel && pc.wcChannel.readyState === 'open') count++;
+        }
+    }
+    return count;
+}
+
+function getWebCodecsViewerPressure() {
+    const now = performance.now();
+    let level = 'normal';
+    let mobile = false;
+    for (const [viewerId, pressure] of _wcViewerPressure.entries()) {
+        if (!pressure || now - pressure.time > 8000) {
+            _wcViewerPressure.delete(viewerId);
+            continue;
+        }
+        if (pressure.mobile) mobile = true;
+        if (pressure.level === 'critical') level = 'critical';
+        else if (pressure.level === 'high' && level !== 'critical') level = 'high';
+    }
+    return { level, mobile, count: _wcViewerPressure.size };
+}
+
+function shouldSkipWebCodecsFrameForPressure(baseFps) {
+    // Keep 60fps as the target. Viewer pressure now reduces bitrate first;
+    // frame dropping is reserved for actual queue congestion elsewhere.
+    return false;
 }
 
 function isWebCodecsPipelineSelected() {
@@ -2599,24 +2686,31 @@ async function startWebCodecsNetworkPipeline(videoTrack) {
 
     function adaptBitrate() {
         const buf = getMaxWcChannelBufferedAmount();
-        if (buf > 512 * 1024) {
+        const viewerCount = Math.max(1, getWcViewerCount());
+        const pressure = getWebCodecsViewerPressure();
+        // A single slow viewer can stall the shared encoder path, so adapt from
+        // the worst queue rather than averaging it away across viewers.
+        if (buf > 512 * 1024 || pressure.level !== 'normal') {
             _wcBufLowCount = 0;
             _wcBufHighCount++;
-            if (_wcBufHighCount >= 2) {
-                const newBitrate = Math.max(1000000, Math.round(_wcAdaptBitrate * 0.8));
+            const requiredSamples = pressure.level === 'critical' ? 2 : 3;
+            if (_wcBufHighCount >= requiredSamples) {
+                const factor = pressure.level === 'critical' ? 0.75 : pressure.level === 'high' ? 0.85 : 0.80;
+                const floor = pressure.mobile ? 800000 : 1000000;
+                const newBitrate = Math.max(floor, Math.round(_wcAdaptBitrate * factor));
                 if (newBitrate !== _wcAdaptBitrate) {
                     _wcAdaptBitrate = newBitrate;
                     wcConfig.bitrate = _wcAdaptBitrate;
                     try { encoder.configure(wcConfig); } catch (_) {}
-                    console.log(`[WebCodecs] Buffer high (${(buf/1024).toFixed(0)}KB), reducing bitrate → ${(_wcAdaptBitrate/1e6).toFixed(1)} Mbps`);
+                    console.log(`[WebCodecs] Pressure=${pressure.level} buf=${(buf/1024).toFixed(0)}KB viewers=${viewerCount}, bitrate → ${(_wcAdaptBitrate/1e6).toFixed(1)} Mbps`);
                 }
                 _wcBufHighCount = 0;
             }
-        } else if (buf === 0) {
+        } else if (buf < 128 * 1024 && pressure.level === 'normal') {
             _wcBufHighCount = 0;
             _wcBufLowCount++;
             if (_wcBufLowCount >= 3 && _wcAdaptBitrate < _wcOrigBitrate) {
-                const newBitrate = Math.min(_wcOrigBitrate, Math.round(_wcAdaptBitrate * 1.15));
+                const newBitrate = Math.min(_wcOrigBitrate, Math.round(_wcAdaptBitrate * 1.2));
                 _wcAdaptBitrate = newBitrate;
                 wcConfig.bitrate = _wcAdaptBitrate;
                 try { encoder.configure(wcConfig); } catch (_) {}
@@ -2672,6 +2766,11 @@ async function startWebCodecsNetworkPipeline(videoTrack) {
                     frame.close();
                     continue;
                 }
+                if (shouldSkipWebCodecsFrameForPressure(_wcFps)) {
+                    _droppedFrameCount++;
+                    frame.close();
+                    continue;
+                }
 
                 let frameToEncode = frame;
                 if (_downscaleCtx) {
@@ -2721,18 +2820,41 @@ async function startWebCodecsNetworkPipeline(videoTrack) {
         _wcForceKeyframe = true;
     }, WC_KEYFRAME_INTERVAL_MS);
 
+    // Ping every viewer every 1s to measure host-side RTT (high precision)
+    setInterval(() => {
+        if (typeof peerConnections === 'undefined') return;
+        for (const pc of Object.values(peerConnections)) {
+            const ch = pc.wcChannel;
+            if (ch && ch.readyState === 'open') {
+                try { ch.send(JSON.stringify({ type: 'wc-ping', t: performance.now() })); } catch (_) {}
+            }
+        }
+    }, 1000);
+
+    // Auto-send viewer stats to server terminal every 1s
+    setInterval(() => {
+        if (_wcEncoder && _wcEncoder.state === 'configured' && typeof peerConnections !== 'undefined') {
+            _sendServerViewerStats();
+        }
+    }, 1000);
+
     console.log('[WebCodecs] Pipeline started. Watch for 2s stats logs...');
 }
 
 function broadcastToViewers(data) {
     if (typeof peerConnections === 'undefined') return;
     const isVideoChunk = data instanceof ArrayBuffer;
+    const isKeyframe = isVideoChunk && data.byteLength > 9 && new Uint8Array(data)[0] === 1;
 
     // If VPS mode is active and authenticated, send to VPS instead of individual DataChannels
     if (_vpsWs && _vpsAuthOk && _vpsWs.readyState === 1) {
-        if (isVideoChunk && _vpsWs.bufferedAmount > WC_MAX_VPS_BUFFER_BYTES) {
-            _wcForceKeyframe = true;
-            return;
+        if (isVideoChunk) {
+            const vpsBuf = _vpsWs.bufferedAmount || 0;
+            if (vpsBuf > WC_DROP_VPS_BUFFER_BYTES) {
+                _wcForceKeyframe = true;
+                return;
+            }
+            if (!isKeyframe && vpsBuf > WC_MAX_VPS_BUFFER_BYTES) return;
         }
         try { _vpsWs.send(data); } catch (e) {
             console.warn('[VPS] Send failed, falling back to P2P:', e.message);
@@ -2758,11 +2880,22 @@ function _broadcastP2P(data) {
     Object.values(peerConnections).forEach(pc => {
         const channel = pc.wcChannel;
         if (channel && channel.readyState === 'open') {
+            const bufferedAmount = channel.bufferedAmount || 0;
+            // Per-viewer backpressure: never add more video to an already
+            // flooded SCTP buffer. The next drain will request a fresh keyframe.
+            if (isVideoChunk) {
+                if (bufferedAmount > WC_DROP_CHANNEL_BUFFER_BYTES) {
+                    _wcForceKeyframe = true;
+                    return;
+                }
+                if (!isKeyframe && bufferedAmount > WC_MAX_CHANNEL_BUFFER_BYTES) return;
+            }
             const maxMsg = pc.sctp?.maxMessageSize ?? 256000;
             if (isVideoChunk && data.byteLength > maxMsg) {
-                const fragHeader = 4 + 4;
+                const fragHeader = 4 + 4 + 4;
                 const maxFrag = maxMsg - fragHeader - 1;
                 const totalSize = data.byteLength;
+                const frameId = (_wcFragmentFrameId++ >>> 0) || 1;
                 let offset = 0;
                 let fragIndex = 0;
                 while (offset < totalSize) {
@@ -2771,19 +2904,15 @@ function _broadcastP2P(data) {
                     const fv = new Uint8Array(frag);
                     fv[0] = 0xFE;
                     const fdv = new DataView(frag);
-                    fdv.setUint32(1, totalSize, true);
-                    fdv.setUint32(5, offset, true);
-                    fv.set(new Uint8Array(data, offset, size), 9);
+                    fdv.setUint32(1, frameId, true);
+                    fdv.setUint32(5, totalSize, true);
+                    fdv.setUint32(9, offset, true);
+                    fv.set(new Uint8Array(data, offset, size), 13);
                     try { channel.send(frag); } catch (_) {}
                     offset += size;
                     fragIndex++;
                 }
                 sent++;
-                return;
-            }
-            // Always allow keyframes through — dropping them causes black screen
-            if (isVideoChunk && !isKeyframe && channel.bufferedAmount > WC_MAX_CHANNEL_BUFFER_BYTES) {
-                _wcForceKeyframe = true;
                 return;
             }
             try {
@@ -3698,6 +3827,150 @@ function _updateStatsHud() {
             }
         }
     }).catch(() => {});
+}
+
+// ── Viewer Debug Panel ─────────────────────────────────────────────────────────
+let _viewerDebugTimer    = null;
+let _viewerDebugEnabled  = false;
+
+function toggleViewerDebug() {
+    _viewerDebugEnabled = !_viewerDebugEnabled;
+    const panel = document.getElementById('viewerDebug');
+    if (panel) panel.style.display = _viewerDebugEnabled ? 'flex' : 'none';
+    const label = document.getElementById('viewerDebugToggleLabel');
+    if (label) label.textContent = _viewerDebugEnabled ? '[hide]' : '[show]';
+    if (_viewerDebugEnabled) {
+        _updateViewerDebug();
+        _viewerDebugTimer = !_viewerDebugTimer ? setInterval(_updateViewerDebug, 2000) : _viewerDebugTimer;
+    } else {
+        if (_viewerDebugTimer) { clearInterval(_viewerDebugTimer); _viewerDebugTimer = null; }
+    }
+}
+
+function _viewerNameForId(viewerId) {
+    const roster = typeof window._rosterData !== 'undefined' ? window._rosterData : [];
+    for (const v of roster) { if (v.id === viewerId) return v.name || viewerId; }
+    return viewerId;
+}
+
+function _allViewerIds() {
+    const ids = new Set();
+    for (const id of Object.keys(peerConnections || {})) ids.add(id);
+    const roster = typeof window._rosterData !== 'undefined' ? window._rosterData : [];
+    for (const v of roster) { if (v.id && v.id !== 'host_0') ids.add(v.id); }
+    if (knownViewers) { for (const id of knownViewers) ids.add(id); }
+    return [...ids];
+}
+
+/** Send viewer stats to Node.js server terminal (runs on interval, async for getStats fallback) */
+async function _sendServerViewerStats() {
+    if (!ws || ws.readyState !== 1) return;
+    const stats = [];
+    if (typeof peerConnections !== 'undefined') {
+        for (const [viewerId, pc] of Object.entries(peerConnections)) {
+            const ch = pc.wcChannel;
+            if (!ch) continue;
+            const name = _viewerNameForId(viewerId);
+            const buf = ch.bufferedAmount || 0;
+            const state = pc.connectionState || '—';
+            let rtt = pc._wcRtt ?? null;
+            // Fallback: if ping/pong hasn't returned yet, try candidate-pair from getStats
+            if (rtt === null && pc) {
+                try {
+                    const s = await pc.getStats();
+                    for (const r of s.values()) {
+                        if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.currentRoundTripTime != null) {
+                            rtt = Math.round(r.currentRoundTripTime * 1000);
+                            break;
+                        }
+                    }
+                } catch (_) {}
+            }
+            stats.push({ name, rtt, bufferKB: Math.round(buf / 1024), state });
+        }
+    }
+    if (stats.length === 0) {
+        stats.push({ name: '(no viewers)', rtt: null, bufferKB: 0, state: '—' });
+    }
+    try { ws.send(JSON.stringify({ type: 'viewer-stats', stats })); } catch (_) {}
+}
+
+async function _updateViewerDebug() {
+    const list = document.getElementById('viewerDebugList');
+    if (!list) return;
+    const isVps = _vpsWs && _vpsAuthOk && _vpsWs.readyState === 1;
+    const ids = _allViewerIds();
+    if (!ids.length) { list.innerHTML = '<div style="font-size:8px;color:var(--muted2);">No viewers connected</div>'; return; }
+
+    // Collect data once
+    const data = [];
+    for (const viewerId of ids) {
+        const name = _viewerNameForId(viewerId);
+        const pc = peerConnections[viewerId];
+        const ch = pc?.wcChannel;
+        const buf = ch ? (ch.bufferedAmount || 0) : 0;
+        const state = pc?.connectionState || (isVps ? 'connected' : '—');
+        // RTT from ping/pong (set on pc._wcRtt by wcChannel.onmessage), fallback to candidate-pair
+        let rtt = pc ? (pc._wcRtt ?? null) : null;
+        if (rtt === null && pc) {
+            try {
+                const s = await pc.getStats();
+                for (const r of s.values()) {
+                    if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.currentRoundTripTime != null) {
+                        rtt = Math.round(r.currentRoundTripTime * 1000);
+                        break;
+                    }
+                }
+            } catch (_) {}
+        }
+        data.push({ name, pc, buf, state, rtt, viewerId });
+    }
+
+    // Render UI
+    const rows = [];
+    let modeLabel = 'P2P';
+    if (isVps) modeLabel = 'VPS' + (Object.keys(peerConnections || {}).length > 0 ? '+P2P' : '');
+    rows.push(`<div class="viewer-debug-row" style="background:none;padding:1px 4px;margin-bottom:2px;">
+        <span style="font-size:7px;color:var(--muted2);text-transform:uppercase;letter-spacing:0.1em;">MODE ${modeLabel}</span>
+        ${isVps ? `<span class="vdr-stat" style="margin-left:auto;"><span class="label">VPS.BUF</span><span class="val">${(_vpsWs.bufferedAmount/1024).toFixed(0)}KB</span></span>` : ''}
+    </div>`);
+    for (const d of data) {
+        if (d.pc) {
+            const b = (d.buf / 1024).toFixed(0);
+            const bc = d.buf > 1500*1024 ? 'vdr-buf-full' : d.buf > 768*1024 ? 'vdr-buf-warn' : 'vdr-buf-ok';
+            const r = d.rtt !== null ? d.rtt.toFixed(1)+'ms' : '—';
+            const sc = d.state === 'connected' ? 'connected' : d.state === 'connecting' ? 'connecting' : 'disconnected';
+            rows.push(`<div class="viewer-debug-row"><span class="vdr-name" title="${d.viewerId}">${d.name}</span><span class="vdr-state ${sc}">${d.state}</span><span class="vdr-stat"><span class="label">RTT</span><span class="val">${r}</span></span><span class="vdr-stat"><span class="label">BUF</span><span class="val ${bc}">${b}KB</span></span></div>`);
+        } else {
+            rows.push(`<div class="viewer-debug-row"><span class="vdr-name" title="${d.viewerId}">${d.name}</span><span class="vdr-state connected">vps</span><span class="vdr-stat"><span class="label">RTT</span><span class="val">—</span></span><span class="vdr-stat"><span class="label">BUF</span><span class="val">via VPS</span></span></div>`);
+        }
+    }
+    list.innerHTML = rows.join('');
+
+    // Console table
+    const t = [];
+    for (const d of data) {
+        const b = (d.buf / 1024).toFixed(0);
+        const r = d.rtt !== null ? d.rtt.toFixed(1)+'ms' : '—';
+        let bs = b + 'KB';
+        if (d.buf > 1500*1024) bs += ' ⚠️';
+        else if (d.buf > 768*1024) bs += ' ⚡';
+        t.push({ Viewer: d.name, RTT: r, Buffer: bs, State: d.state });
+    }
+    if (isVps) t.unshift({ Viewer: '[VPS relay]', RTT: '—', Buffer: (_vpsWs.bufferedAmount/1024).toFixed(0)+'KB', State: 'connected' });
+    console.table(t, ['Viewer', 'RTT', 'Buffer', 'State']);
+
+    // ── Send stats to server terminal ──
+    if (ws && ws.readyState === 1) {
+        try {
+            ws.send(JSON.stringify({ type: 'viewer-stats', stats: data.map(d => ({
+                name: d.name,
+                rtt: d.rtt !== null ? Math.round(d.rtt) : null,
+                bufferKB: Math.round(d.buf / 1024),
+                state: d.state
+            })) }));
+        } catch (_) {}
+    }
 }
 
 // ── Input Visualizer ──────────────────────────────────────────────────────────

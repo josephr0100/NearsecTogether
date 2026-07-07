@@ -1707,6 +1707,23 @@ async function main() {
             }
           }
 
+          if (msg.type === "viewer-stats") {
+            console.log("");
+            console.log("═══════════════ VIEWER STATS ═══════════════");
+            if (msg.stats && msg.stats.length > 0) {
+              for (const s of msg.stats) {
+                const bufFlag = s.bufferKB > 1500 ? ' ⚠️' : s.bufferKB > 768 ? ' ⚡' : '';
+                const rttStr = s.rtt !== null ? s.rtt.toFixed(1) + 'ms' : '—';
+                console.log(`  ${s.name.padEnd(16)} RTT: ${rttStr.padEnd(7)} BUF: ${s.bufferKB}KB${bufFlag}  [${s.state}]`);
+              }
+            } else {
+              console.log("  No viewers connected");
+            }
+            console.log("═════════════════════════════════════════════");
+            console.log("");
+            return;
+          }
+
           // ── VPS viewer registration ───────────────────────────────────────
           // When a viewer connects via the Rust SFU router, host.js forwards
           // synthetic join/leave messages so the server can manage the roster,

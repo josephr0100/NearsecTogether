@@ -157,6 +157,53 @@ function requestKeyframeFromHostThrottled() {
     requestKeyframeFromHost();
 }
 
+function sendWebCodecsPressure(level, detail) {
+    const now = performance.now();
+    if (!_wcChannel || _wcChannel.readyState !== 'open') return;
+    if (_wcPressureState === level && now - _wcPressureLastSentAt < 2000) return;
+    _wcPressureState = level;
+    _wcPressureLastSentAt = now;
+    try {
+        _wcChannel.send(JSON.stringify({
+            type: 'wc-pressure',
+            level,
+            detail,
+            mobile: _wcIsConstrainedMobile,
+            targetDelayMs: _wcTargetDelayMs
+        }));
+    } catch (_) {}
+}
+
+function updateWebCodecsLatencyMode(pending, queueSize) {
+    const now = performance.now();
+    const struggling = pending > (_wcIsConstrainedMobile ? 18 : 24) || queueSize > (_wcIsConstrainedMobile ? 8 : 12);
+    const critical = pending > (_wcIsConstrainedMobile ? 42 : 60) || queueSize > (_wcIsConstrainedMobile ? 18 : 24);
+
+    if (critical) {
+        _wcLatencyMode = 'stable';
+        _wcTargetDelayMs = 0;
+        _wcStableSince = now;
+        _wcHealthySince = 0;
+        sendWebCodecsPressure('critical', { pending, queueSize });
+    } else if (struggling) {
+        _wcLatencyMode = 'balanced';
+        _wcTargetDelayMs = 0;
+        _wcStableSince = now;
+        _wcHealthySince = 0;
+        sendWebCodecsPressure('high', { pending, queueSize });
+    } else {
+        if (!_wcHealthySince) _wcHealthySince = now;
+        if (now - _wcHealthySince > 5000) {
+            _wcLatencyMode = 'low';
+            _wcTargetDelayMs = 0;
+            sendWebCodecsPressure('recover', { pending, queueSize });
+        }
+    }
+
+    _wcStats.latencyMode = _wcLatencyMode;
+    _wcStats.targetDelayMs = _wcTargetDelayMs;
+}
+
 let _nsWaitKeyTimer = null;
 function startNsWaitKeyRetry() {
     clearInterval(_nsWaitKeyTimer);
@@ -210,31 +257,31 @@ function shouldDropWebCodecsChunk(isKey) {
     if (!wcDecoder || wcDecoder.state !== 'configured') return true;
     const pending = getWcTotalPending();
     const queueSize = wcDecoder.decodeQueueSize || 0;
+    updateWebCodecsLatencyMode(pending, queueSize);
+    const maxDecoderQueue = _wcIsConstrainedMobile ? WC_MOBILE_MAX_DECODER_QUEUE : WC_MAX_DECODER_QUEUE;
+    const hardDecoderQueue = _wcIsConstrainedMobile ? WC_MOBILE_HARD_DECODER_QUEUE : WC_HARD_DECODER_QUEUE;
+    const severePending = _wcIsConstrainedMobile ? 60 : 60;
+    const moderatePending = _wcIsConstrainedMobile ? 24 : 30;
+    const mildPending = _wcIsConstrainedMobile ? 8 : 10;
 
     // ── Adaptive backlog control ──
-    // pending=chunks received but not yet decoded (total pipeline)
-    // queueSize=chunks waiting inside the decoder (internal queue)
     
-    // Severe: backlog > 1 sec → reset decoder entirely
-    if (pending > 60) {
+    if (pending > severePending) {
         console.warn(`[WebCodecs] Backlog ${pending} chunks — resetting decoder`);
         recoverWebCodecsDecoder();
         return true;
     }
 
-    // Moderate: backlog > 0.5 sec → drop deltas + request keyframe
-    if (pending > 30) {
+    if (pending > moderatePending) {
         if (!isKey) return true;
         requestKeyframeFromHostThrottled();
         return false;
     }
 
-    // Mild: backlog > 0.15 sec → drop deltas only
-    if (pending > 10 && !isKey) return true;
+    if (!isKey && pending > mildPending) return true;
 
-    // Decoder internal queue full
     if (isKey) return false;
-    if (queueSize > WC_HARD_DECODER_QUEUE) {
+    if (queueSize > hardDecoderQueue) {
         if (!_wcStuckSince) _wcStuckSince = performance.now();
         else if (performance.now() - _wcStuckSince > 1000) {
             requestKeyframeFromHostThrottled();
@@ -243,7 +290,7 @@ function shouldDropWebCodecsChunk(isKey) {
         return true;
     }
     _wcStuckSince = 0;
-    if (queueSize > WC_MAX_DECODER_QUEUE) return true;
+    if (queueSize > maxDecoderQueue) return true;
     return false;
 }
 
@@ -252,6 +299,7 @@ let _lastWcConfig = null;
 function recoverWebCodecsDecoder() {
     window.nsWaitKey = true;
     _wcStuckSince = 0;
+    _wcFragmentParts.clear();
     startNsWaitKeyRetry();
     requestKeyframeFromHost();
     try { if (wcDecoder?.state !== 'closed') wcDecoder.close(); } catch (_) { }
@@ -265,6 +313,55 @@ function recoverWebCodecsDecoder() {
             initWebCodecsViewer(_lastWcConfig);
         }, 500);
     }
+}
+
+function reassembleWebCodecsFragment(buffer) {
+    const fv = new Uint8Array(buffer);
+    if (fv[0] !== 0xFE) return buffer;
+    if (buffer.byteLength < 9) return null;
+
+    const dv = new DataView(buffer);
+    let frameId = 0;
+    let totalSize = dv.getUint32(1, true);
+    let offset = dv.getUint32(5, true);
+    let headerSize = 9;
+
+    // New format: [0xFE][frameId u32][total u32][offset u32][payload...].
+    // Keep old format support so mixed clients do not explode during upgrades.
+    if (buffer.byteLength >= 13) {
+        const newFrameId = dv.getUint32(1, true);
+        const newTotal = dv.getUint32(5, true);
+        const newOffset = dv.getUint32(9, true);
+        if (newTotal > 0 && newTotal <= 16 * 1024 * 1024 && newOffset < newTotal) {
+            frameId = newFrameId;
+            totalSize = newTotal;
+            offset = newOffset;
+            headerSize = 13;
+        }
+    }
+
+    if (totalSize <= 0 || totalSize > 16 * 1024 * 1024 || offset >= totalSize) return null;
+    const fragData = fv.subarray(headerSize);
+    const key = frameId || totalSize;
+    let entry = _wcFragmentParts.get(key);
+    if (!entry || entry.total !== totalSize) {
+        entry = { total: totalSize, buf: new Uint8Array(totalSize), received: 0 };
+        _wcFragmentParts.set(key, entry);
+    }
+
+    entry.buf.set(fragData, offset);
+    entry.received += fragData.length;
+
+    if (_wcFragmentParts.size > 12) {
+        const oldest = _wcFragmentParts.keys().next().value;
+        _wcFragmentParts.delete(oldest);
+    }
+
+    if (entry.received >= entry.total) {
+        _wcFragmentParts.delete(key);
+        return entry.buf.buffer;
+    }
+    return null;
 }
 let sysAudioCtx = null;
 let nextAudioTime = 0;
@@ -303,13 +400,26 @@ let _videoReceiver = null;
 let _liveVideoEl = null;
 const WC_MAX_DECODER_QUEUE = 8;
 const WC_HARD_DECODER_QUEUE = 16;
+const WC_MOBILE_MAX_DECODER_QUEUE = 4;
+const WC_MOBILE_HARD_DECODER_QUEUE = 8;
 let _wcLastKeyframeRequestAt = 0;
 let _wcStuckSince = 0;
 let _wcLastOutputTime = 0;
-let _wcStats = { chunksIn: 0, framesDecoded: 0, fps: 0, _lastFpsTime: 0, _fpsCount: 0, latencies: [], _lastArrival: 0, queueSize: 0 };
+let _wcStats = { chunksIn: 0, framesDecoded: 0, fps: 0, _lastFpsTime: 0, _fpsCount: 0, latencies: [], _lastArrival: 0, queueSize: 0, latencyMode: 'low', targetDelayMs: 0 };
 let _wcFragmentBuf = null;
 let _wcFragmentTotal = 0;
 let _wcFragmentOffset = 0;
+let _wcFragmentParts = new Map();
+let _wcChannel = null;   // DataChannel reference for ping/pong RTT measurement
+let _wcRtt = null;       // RTT in ms, measured via ping/pong
+const _wcIsConstrainedMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) &&
+    (((navigator.deviceMemory || 8) <= 3) || ((navigator.hardwareConcurrency || 8) <= 4));
+let _wcLatencyMode = 'low';
+let _wcTargetDelayMs = 0;
+let _wcPressureState = 'recover';
+let _wcPressureLastSentAt = 0;
+let _wcStableSince = 0;
+let _wcHealthySince = performance.now();
 // Pre-wire to the canvas already in index.html so initWebCodecsViewer never
 // creates a duplicate element.
 let wcCanvas = document.getElementById('webcodecs-canvas') || null;
@@ -500,6 +610,7 @@ async function createPC() {
 
     pc.ondatachannel = (event) => {
         const channel = event.channel;
+        _wcChannel = channel;
 
         // --- WEBCODECS VIDEO PIPELINE ---
         if (channel.label === 'webcodecs') {
@@ -527,6 +638,11 @@ async function createPC() {
                         const msg = JSON.parse(e.data);
                         if (msg.type === 'webcodecs-config') {
                             initWebCodecsViewer(msg);
+                        } else if (msg.type === 'wc-pong') {
+                            _wcRtt = performance.now() - msg.t;
+                        } else if (msg.type === 'wc-ping') {
+                            // Respond so host can measure its RTT to this viewer
+                            try { _wcChannel.send(JSON.stringify({ type: 'wc-pong', t: msg.t })); } catch (_) {}
                         }
                     } catch (err) {
                         console.warn('[WebCodecs] Failed to parse string message:', err);
@@ -539,28 +655,9 @@ async function createPC() {
                     // Prevent double-decoding if we are receiving frames from the VPS SFU
                     if (ws && ws.url.includes('/vps')) return;
 
-                    // ── Fragment reassembly ──
-                    const fv = new Uint8Array(e.data);
-                    if (fv[0] === 0xFE) {
-                        const totalSize = new DataView(e.data).getUint32(1, true);
-                        const offset = new DataView(e.data).getUint32(5, true);
-                        const fragData = fv.subarray(9);
-                        if (!_wcFragmentBuf || _wcFragmentTotal !== totalSize) {
-                            _wcFragmentBuf = new Uint8Array(totalSize);
-                            _wcFragmentTotal = totalSize;
-                            _wcFragmentOffset = 0;
-                        }
-                        _wcFragmentBuf.set(fragData, offset);
-                        _wcFragmentOffset += fragData.length;
-                        if (_wcFragmentOffset >= totalSize) {
-                            e.data = _wcFragmentBuf.buffer;
-                            _wcFragmentBuf = null;
-                            _wcFragmentTotal = 0;
-                            _wcFragmentOffset = 0;
-                        } else {
-                            return;
-                        }
-                    }
+                    const reassembled = reassembleWebCodecsFragment(e.data);
+                    if (!reassembled) return;
+                    e.data = reassembled;
 
                     if (!wcDecoder || wcDecoder.state !== 'configured') return;
 
@@ -596,6 +693,12 @@ async function createPC() {
                     }
                 }
             };
+            // ── Start ping/pong RTT measurement (1s, high precision) ──
+            setInterval(() => {
+                if (_wcChannel && _wcChannel.readyState === 'open') {
+                    try { _wcChannel.send(JSON.stringify({ type: 'wc-ping', t: performance.now() })); } catch (_) {}
+                }
+            }, 1000);
             return; // Stop here so it doesn't fall through to the input block
         }
 
@@ -999,6 +1102,8 @@ function startFrameProcessor(track) {
 }
 
 // ── INPUT ─────────────────────────────────────────────────────────────────────
+const _pressedKeys = new Set(); // track currently-held keys to release on blur
+
 const keyMap = {
     'KeyW': 'KEY_W', 'KeyA': 'KEY_A', 'KeyS': 'KEY_S', 'KeyD': 'KEY_D',
     'ArrowUp': 'KEY_UP', 'ArrowDown': 'KEY_DOWN', 'ArrowLeft': 'KEY_LEFT', 'ArrowRight': 'KEY_RIGHT',
@@ -1076,11 +1181,30 @@ document.addEventListener('click', e => {
     }
 });
 document.addEventListener('click', e => { if (e.target === frameCanvas || e.target === video || (typeof wcCanvas !== 'undefined' && e.target === wcCanvas)) requestPointerLock(); });
-document.addEventListener('keydown', e => { if (!document.pointerLockElement) return; if (keyMap[e.code]) { e.preventDefault(); sendKbm({ event: 'keydown', key: keyMap[e.code] }); } });
-document.addEventListener('keyup', e => { if (!document.pointerLockElement) return; if (keyMap[e.code]) { e.preventDefault(); sendKbm({ event: 'keyup', key: keyMap[e.code] }); } });
+document.addEventListener('keydown', e => { if (!document.pointerLockElement) return; const k = keyMap[e.code]; if (k) { e.preventDefault(); _pressedKeys.add(k); sendKbm({ event: 'keydown', key: k }); } });
+document.addEventListener('keyup', e => { if (!document.pointerLockElement) return; const k = keyMap[e.code]; if (k) { e.preventDefault(); _pressedKeys.delete(k); sendKbm({ event: 'keyup', key: k }); } });
 document.addEventListener('mousemove', e => { if (!document.pointerLockElement) return; sendKbm({ event: 'mousemove', dx: e.movementX, dy: e.movementY }); });
-document.addEventListener('mousedown', e => { if (!document.pointerLockElement) return; if (mouseMap[e.button]) sendKbm({ event: 'keydown', key: mouseMap[e.button] }); });
-document.addEventListener('mouseup', e => { if (!document.pointerLockElement) return; if (mouseMap[e.button]) sendKbm({ event: 'keyup', key: mouseMap[e.button] }); });
+document.addEventListener('mousedown', e => { if (!document.pointerLockElement) return; const k = mouseMap[e.button]; if (k) { _pressedKeys.add(k); sendKbm({ event: 'keydown', key: k }); } });
+document.addEventListener('mouseup', e => { if (!document.pointerLockElement) return; const k = mouseMap[e.button]; if (k) { _pressedKeys.delete(k); sendKbm({ event: 'keyup', key: k }); } });
+
+// ── Release all held keys on blur/focus-loss (fixes stuck keys) ──
+function _releaseAllKeys() {
+    if (_pressedKeys.size === 0) return;
+    for (const k of _pressedKeys) {
+        sendKbm({ event: 'keyup', key: k });
+    }
+    _pressedKeys.clear();
+}
+// window blur — alt+tab, switch app, etc.
+window.addEventListener('blur', _releaseAllKeys);
+// pointer lock lost — ESC or focus change
+document.addEventListener('pointerlockchange', () => {
+    if (!document.pointerLockElement) _releaseAllKeys();
+});
+// tab becomes hidden — mobile browser suspend
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) _releaseAllKeys();
+});
 
 // ── TOUCH ─────────────────────────────────────────────────────────────────────
 let touchMode = false, useGyro = false;
@@ -2036,6 +2160,12 @@ async function connect() {
         _wcLastPendingCheck = 0;
         _wcLastFramesDecodedCheck = 0;
         _wcLastOutputTime = 0;
+            _wcLatencyMode = 'low';
+            _wcTargetDelayMs = 0;
+        _wcPressureState = 'recover';
+        _wcHealthySince = performance.now();
+        _wcStats.latencyMode = _wcLatencyMode;
+        _wcStats.targetDelayMs = _wcTargetDelayMs;
         _wcStats.fps = 0;
         _wcStats._lastFpsTime = 0;
         _wcStats._fpsCount = 0;
@@ -2167,8 +2297,11 @@ async function updateStats() {
     try {
         const stats = await pc.getStats();
         let rtt = null, jitter = null, kbps = null, packetsLost = 0, packetsReceived = 0;
+        // Use ping/pong RTT when available (reliable with DataChannel),
+        // otherwise fall back to candidate-pair from getStats.
+        if (USE_WEBCODECS && _wcRtt !== null) rtt = _wcRtt.toFixed(1);
         for (const r of stats.values()) {
-            if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.currentRoundTripTime != null)
+            if (rtt === null && r.type === 'candidate-pair' && r.state === 'succeeded' && r.currentRoundTripTime != null)
                 rtt = (r.currentRoundTripTime * 1000).toFixed(0);
             if (r.type === 'inbound-rtp' && r.kind === 'video') {
                 packetsLost = r.packetsLost || 0;
@@ -2221,6 +2354,7 @@ async function updateStats() {
             parts.push(`${_wcStats.fps}fps`);
             parts.push(`buf:${pending}`);
             parts.push(`q:${_wcStats.queueSize}`);
+            parts.push(`${_wcStats.latencyMode}:${_wcStats.targetDelayMs}ms`);
             if (_wcStats.latencies.length > 0) {
                 const avg = _wcStats.latencies.reduce((a, b) => a + b, 0) / _wcStats.latencies.length;
                 parts.push(`${avg.toFixed(0)}ms`);
@@ -2478,7 +2612,7 @@ function initWebCodecsViewer(config) {
         delete decoderConfig.optimizeForLatency;
         wcDecoder.configure(decoderConfig);
     }
-    console.log('[WebCodecs] Hardware Decoder Ready!');
+    console.log(`[WebCodecs] Hardware Decoder Ready! mode=${_wcLatencyMode} delay=${_wcTargetDelayMs}ms`);
 }
 
 // ── STEAM DECK / IMMERSIVE AUTO-DETECT ───────────────────────────────────────
@@ -2629,7 +2763,7 @@ window.startNetStats = function() {
             const elBuf = document.getElementById('nsBuf');
             if (elBuf) {
                 const pending = _wcStats.chunksIn - _wcStats.framesDecoded;
-                elBuf.textContent = pending + ' chunks';
+                elBuf.textContent = `${pending} chunks (${_wcStats.latencyMode}/${_wcStats.targetDelayMs}ms)`;
             }
         }
     }, 1000);

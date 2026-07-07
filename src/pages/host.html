@@ -176,6 +176,14 @@
             <span class="stats-inline-cell"><span class="stats-inline-key">ENC.LAT</span><span class="stats-inline-val"
                 id="hudEncodeLat">—</span></span>
           </div>
+          <div id="viewerDebug"
+            style="display:none;gap:3px;margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.05);flex-direction:column;">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span onclick="toggleViewerDebug()" style="cursor:pointer;user-select:none;" class="stats-inline-key">VIEWERS <span id="viewerDebugToggleLabel">[show]</span></span>
+              <span onclick="toggleViewerDebug()" style="cursor:pointer;font-size:8px;color:var(--muted2);font-family:var(--mono);">[x]</span>
+            </div>
+            <div id="viewerDebugList" style="display:flex;flex-direction:column;gap:3px;"></div>
+          </div>
         </div>
 
         <div class="dock-card">
